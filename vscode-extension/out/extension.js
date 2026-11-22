@@ -87,7 +87,17 @@ async function loginToServer() {
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ email: email.trim(), password })
         });
-        const data = await response.json();
+        const responseText = await response.text();
+        let data;
+        try {
+            data = JSON.parse(responseText);
+        }
+        catch {
+            const detail = responseText.trim()
+                ? ` Ответ сервера: ${responseText.trim().slice(0, 200)}`
+                : ' Сервер вернул пустой ответ.';
+            throw new Error(`Некорректный ответ сервера (HTTP ${response.status}).${detail}`);
+        }
         if (!response.ok || !data.token) {
             throw new Error(data.error || `HTTP ${response.status}`);
         }
@@ -233,6 +243,7 @@ async function executeAudit(folderPath, scenarioId, scenarioTitle) {
                     progress.report({ message: 'Передача ZIP-архива на сервер uncflow...' });
                     const uploadRes = await client.uploadArchive(zipBuffer, 'vscode-project.zip');
                     codePath = uploadRes.path;
+                    progress.report({ message: `Загружено файлов: ${uploadRes.fileCount}. Запуск проверки...` });
                 }
                 catch (uploadError) {
                     if (!/Not found|404/i.test(uploadError.message))

@@ -124,11 +124,18 @@ class UncflowClient {
             throw new Error(`Ошибка загрузки архива проекта на ${serverUrl}: ${msg}`);
         }
         const data = await res.json();
-        return data;
+        if (typeof data.path !== 'string' ||
+            !data.path.trim() ||
+            typeof data.fileCount !== 'number' ||
+            !Number.isInteger(data.fileCount) ||
+            data.fileCount < 1) {
+            throw new Error(`Сервер принял ZIP-архив на ${serverUrl}, но вернул некорректный путь проекта или число файлов.`);
+        }
+        return { path: data.path, fileCount: data.fileCount };
     }
     async runAudit(scenarioId, params) {
         const serverUrl = this.getServerUrl();
-        if (params.repository) {
+        if (params.repository || params.codePath) {
             const templates = await this.getTemplates();
             const template = templates.find(item => item.id === scenarioId) ||
                 templates.find(item => item.id === 'template-full-audit');
@@ -137,7 +144,14 @@ class UncflowClient {
             }
             const graph = JSON.parse(JSON.stringify(template.graph));
             for (const node of graph.nodes || []) {
-                if (node.type === 'source.local' || node.type === 'source.archive') {
+                if (params.codePath && ['source.local', 'source.archive', 'source.git'].includes(node.type)) {
+                    node.type = 'source.local';
+                    node.settings = {
+                        ...(node.settings || {}),
+                        path: params.codePath
+                    };
+                }
+                else if (params.repository && (node.type === 'source.local' || node.type === 'source.archive')) {
                     node.type = 'source.git';
                     node.settings = {
                         ...(node.settings || {}),
@@ -162,31 +176,30 @@ class UncflowClient {
                 throw new Error(`Ошибка запуска Git-аудита (${res.status}): ${text}`);
             }
             const run = await res.json();
+            if (run.success === false) {
+                const failures = Object.entries(run.errors || {})
+                    .map(([nodeId, error]) => `${nodeId}: ${String(error)}`)
+                    .join('; ');
+                throw new Error(`Проверка не завершилась${failures ? `: ${failures}` : '.'}`);
+            }
+            const outputs = run.nodeOutputs || {};
+            const reportAndAggregatorNodes = graph.nodes.filter((node) => ['report.dual', 'report.json', 'scanner.aggregator', 'scan.aggregator'].includes(node.type));
             let findings = [];
-            if (run.runId) {
-                try {
-                    const historyUrl = `${serverUrl}/api/history/${encodeURIComponent(run.runId)}`;
-                    const historyRes = await fetch(historyUrl, {
-                        headers: { Accept: 'application/json', ...this.getAuthHeaders() }
-                    });
-                    if (historyRes.ok) {
-                        const history = await historyRes.json();
-                        findings = Array.from(history.findings || []);
-                    }
+            for (const node of reportAndAggregatorNodes) {
+                const output = outputs[node.id];
+                const nodeFindings = Array.isArray(output?.allFindings) && output.allFindings.length > 0
+                    ? output.allFindings
+                    : output?.findings;
+                if (Array.isArray(nodeFindings) && nodeFindings.length > 0) {
+                    findings = nodeFindings;
+                    break;
                 }
-                catch { }
             }
             if (findings.length === 0) {
-                try {
-                    const latestRes = await fetch(`${serverUrl}/api/reports/latest`, {
-                        headers: { Accept: 'application/json', ...this.getAuthHeaders() }
-                    });
-                    if (latestRes.ok) {
-                        const latest = await latestRes.json();
-                        findings = Array.isArray(latest.findings) ? latest.findings : [];
-                    }
-                }
-                catch { }
+                const scannerTypes = ['scanner.sast', 'scan.sast', 'scanner.secrets', 'scan.secret', 'scanner.sca', 'scan.sca'];
+                findings = graph.nodes
+                    .filter((node) => scannerTypes.includes(node.type))
+                    .flatMap((node) => Array.isArray(outputs[node.id]?.findings) ? outputs[node.id].findings : []);
             }
             const summary = {
                 critical: findings.filter(f => f.severity === 'CRITICAL').length,
@@ -211,7 +224,6 @@ class UncflowClient {
         };
         if (params.codePath) {
             bodyPayload.codePath = params.codePath;
-            bodyPayload.repository = params.codePath;
         }
         else if (params.repository) {
             bodyPayload.repository = params.repository;
