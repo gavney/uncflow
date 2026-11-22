@@ -14,8 +14,11 @@ export class CiCdManager {
   /**
    * Generates GitHub Actions workflow YAML configuration
    */
-  public static generateGitHubWorkflow(serverUrl: string = 'http://localhost:3001', apiKey: string = 'SECRET_CI_KEY'): string {
-    return `name: uncflow Gatekeeper
+public static generateGitHubWorkflow(
+  serverUrl: string = 'http://localhost:3001',
+  apiKeyExpr: string = '${{ secrets.UNCFLOW_CI_TOKEN }}'
+): string {
+  return `name: uncflow Security Gatekeeper
 
 on:
   push:
@@ -25,45 +28,55 @@ on:
 
 jobs:
   security-audit:
-    name: Run uncflow Audit
+    name: Run uncflow AppSec Audit
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
       - name: Run uncflow Audit via Platform API
-        id: security_step
         run: |
-          echo "Starting security scan on commit \${{ github.sha }}..."
-          
-          # Call the uncflow API
-          RESPONSE=\$(curl -s -X POST "${serverUrl}/api/ci/run" \\
+          echo "Starting uncflow security scan for \${{ github.repository }}..."
+
+          HTTP_CODE=\$(curl -sS -w "%{http_code}" -o audit-result.json \\
+            -X POST "${serverUrl}/api/ci/run" \\
             -H "Content-Type: application/json" \\
-            -H "Authorization: Bearer ${apiKey}" \\
+            -H "Authorization: Bearer ${apiKeyExpr}" \\
             -d '{
               "repo": "\${{ github.repository }}",
               "commitSha": "\${{ github.sha }}",
-              "branch": "\${{ github.ref_name }}",
+              "branch": "\${{ github.head_ref || github.ref_name }}",
               "failOnCritical": true
             }')
-          
-          echo "\$RESPONSE" > audit-result.json
-          
-          # Extract status and exit code
-          EXIT_CODE=\$(node -e 'console.log(JSON.parse(require("fs").readFileSync("audit-result.json", "utf-8")).exitCode || 0)')
-          TOTAL=\$(node -e 'console.log(JSON.parse(require("fs").readFileSync("audit-result.json", "utf-8")).totalFindings || 0)')
-          CRITICAL=\$(node -e 'console.log(JSON.parse(require("fs").readFileSync("audit-result.json", "utf-8")).criticalCount || 0)')
-          
-          echo "Total findings: \$TOTAL, Critical/High: \$CRITICAL"
-          
-          if [ "\$EXIT_CODE" -ne 0 ]; then
-            echo "::error::uncflow detected critical vulnerabilities! Blocking build."
-            exit \$EXIT_CODE
+
+          echo "HTTP status: \$HTTP_CODE"
+          if [ "\$HTTP_CODE" -ne 200 ]; then
+            cat audit-result.json
+            echo "::error::uncflow API returned HTTP \$HTTP_CODE"
+            exit 1
           fi
-          
-          echo "Security check passed successfully."
+
+          node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.summaryMarkdown || "")' >> \$GITHUB_STEP_SUMMARY
+
+          EXIT_CODE=\$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.exitCode ?? 1)')
+          TOTAL=\$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.totalFindings ?? 0)')
+          CRITICAL=\$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.criticalCount ?? 0)')
+          HIGH=\$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.highCount ?? 0)')
+
+          echo "Total findings: \$TOTAL (Critical: \$CRITICAL, High: \$HIGH)"
+
+          if [ "\$EXIT_CODE" -ne 0 ]; then
+            echo "::error::uncflow detected blocking vulnerabilities! Build failed."
+            exit "\$EXIT_CODE"
+          fi
+
+          echo "Security check passed."
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uncflow-audit-result
+          path: audit-result.json
 `;
-  }
+}
 
   /**
    * Generates GitLab CI configuration YAML

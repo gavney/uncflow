@@ -5273,21 +5273,65 @@
             <div class="space-y-1 pr-3 flex-1 min-w-0">
               <div class="flex items-center space-x-2">
                 <span class="font-bold text-xs text-white truncate font-mono">${escapeHtml(r.name)}</span>
-                ${r.isPrivate ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-medium">Приватный</span>' : '<span class="text-[9px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-300">Публичный</span>'}
+                ${r.private ? '<span class="text-[9px] px-1.5 py-0.5 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-medium">Приватный</span>' : '<span class="text-[9px] px-1.5 py-0.5 rounded bg-gray-700 text-gray-300">Публичный</span>'}
               </div>
               <p class="text-[11px] text-gray-400 truncate">${escapeHtml(r.description || 'Без описания')}</p>
               <div class="text-[10px] text-gray-500 font-mono">${escapeHtml(r.defaultBranch || 'main')}</div>
             </div>
-            <button onclick="selectRepoForAudit('${escapeHtml(r.cloneUrl)}', '${escapeHtml(r.defaultBranch || 'main')}', '${escapeHtml(r.name)}')" class="liquid-btn-primary px-3 py-1.5 text-xs text-white shrink-0 flex items-center space-x-1">
-              <i class="fa-solid fa-play text-[10px]"></i>
-              <span>Выбрать для аудита</span>
-            </button>
+            <div class="flex items-center space-x-2 shrink-0">
+              <button onclick="installGithubCiCd('${escapeHtml(r.fullName)}', '${escapeHtml(r.defaultBranch || 'main')}', this)"
+                      class="px-3 py-1.5 rounded-xl bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/40 text-xs text-emerald-200 flex items-center space-x-1 transition">
+                <i class="fa-solid fa-bolt text-[10px]"></i>
+                <span>Подключить CI/CD</span>
+              </button>
+              <button onclick="selectRepoForAudit('${escapeHtml(r.cloneUrl)}', '${escapeHtml(r.defaultBranch || 'main')}', '${escapeHtml(r.name)}')"
+                      class="liquid-btn-primary px-3 py-1.5 text-xs text-white flex items-center space-x-1">
+                <i class="fa-solid fa-play text-[10px]"></i>
+                <span>Аудит</span>
+              </button>
+            </div>
           </div>
         `).join('');
       } catch (err) {
         container.innerHTML = `<div class="p-6 text-center text-xs text-red-400">Ошибка: ${escapeHtml(err.message)}</div>`;
       }
     }
+
+    async function installGithubCiCd(fullRepo, branch, btn) {
+  if (!currentAuthToken) {
+    showBanner('Сначала войдите через GitHub');
+    return;
+  }
+  const origHtml = btn.innerHTML;
+  btn.disabled = true;
+  btn.innerHTML = '<i class="fa-solid fa-spinner fa-spin text-[10px]"></i><span>Подключаю...</span>';
+
+  try {
+    const res = await fetch('/api/ci/install-github', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${currentAuthToken}`
+      },
+      body: JSON.stringify({ repo: fullRepo, branch })
+    });
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || `HTTP ${res.status}`);
+    }
+
+    btn.innerHTML = '<i class="fa-solid fa-check text-[10px]"></i><span>CI/CD активен</span>';
+    btn.classList.remove('bg-emerald-500/20', 'border-emerald-500/40');
+    btn.classList.add('bg-emerald-600/40', 'border-emerald-400');
+    showBanner(`CI/CD установлен в ${fullRepo}! Откройте Actions на GitHub.`);
+    setTimeout(hideBanner, 5000);
+  } catch (err) {
+    btn.disabled = false;
+    btn.innerHTML = origHtml;
+    showBanner(`Ошибка CI/CD: ${err.message}`);
+    setTimeout(hideBanner, 5000);
+  }
+}
 
     function selectRepoForAudit(cloneUrl, defaultBranch, repoName) {
       if (!currentWorkflow) return;

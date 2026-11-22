@@ -1,5 +1,7 @@
 import './config/env.ts';
 import * as http from 'http';
+import * as crypto from 'crypto';
+import _sodium from 'libsodium-wrappers';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomUUID } from 'crypto';
@@ -448,7 +450,7 @@ const server = http.createServer(async (req, res) => {
         return;
       }
       const redirectUri = encodeURIComponent(`${getPublicBaseUrl(req)}/api/auth/github/callback`);
-      const ghAuthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=repo,read:user,user:email`;
+      const ghAuthUrl = `https://github.com/login/oauth/authorize?client_id=${clientId}&redirect_uri=${redirectUri}&scope=repo,workflow,read:user,user:email`;
       res.writeHead(302, { 'Location': ghAuthUrl });
       res.end();
       return;
@@ -1035,54 +1037,109 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 8. POST /api/ci/run and /api/v1/ci/run (Headless CI runner)
-    if (req.method === 'POST' && (pathname === '/api/ci/run' || pathname === '/api/v1/ci/run')) {
-      const ciTokenHeader = req.headers['x-ci-token'] as string;
-      const authHeader = req.headers.authorization || '';
-      const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
-      const token = ciTokenHeader || bearerToken;
-      const expectedToken = process.env.CI_API_TOKEN || 'SECRET_CI_KEY';
+if (req.method === 'POST' && (pathname === '/api/ci/run' || pathname === '/api/v1/ci/run')) {
+  const body = await parseJsonBody(req);
+  const rawRepo = (body.repo || body.repository || '').trim();
+  const normalizedFullRepo = rawRepo
+    .replace(/^https?:\/\/github\.com\//i, '')
+    .replace(/\.git$/i, '')
+    .trim();
 
-      let authorized = false;
-      if (token && token === expectedToken) {
-        authorized = true;
-      } else {
-        const user = await getUserFromRequest(req);
-        if (user) authorized = true;
+  const ciTokenHeader = req.headers['x-ci-token'] as string;
+  const authHeader = req.headers.authorization || '';
+  const bearerToken = authHeader.startsWith('Bearer ') ? authHeader.substring(7).trim() : '';
+  const token = ciTokenHeader || bearerToken;
+  const expectedGlobalToken = process.env.CI_API_TOKEN || 'SECRET_CI_KEY';
+
+  let authorized = false;
+  let repoOwner: UserProfile | null = null;
+  let boundWorkflowId: string | undefined;
+
+  // 1. Проверка уникального per-repo токена из Vault
+  if (token && normalizedFullRepo) {
+    const rawSaved = await db.getSecret(`ci_repo:${normalizedFullRepo.toLowerCase()}`);
+    if (rawSaved) {
+      try {
+        const parsed = JSON.parse(SecretVault.decrypt(rawSaved));
+        const a = Buffer.from(token);
+        const b = Buffer.from(String(parsed.token || ''));
+        if (a.length === b.length && crypto.timingSafeEqual(a, b)) {
+          authorized = true;
+          boundWorkflowId = parsed.workflowId;
+          if (parsed.userId) {
+            repoOwner = await db.getUserById(parsed.userId);
+          }
+        }
+      } catch {}
+    }
+  }
+
+  // 2. Fallback: глобальный CI_API_TOKEN или пользовательская сессия
+  if (!authorized && token && token === expectedGlobalToken) {
+    authorized = true;
+  }
+  if (!authorized) {
+    const reqUser = await getUserFromRequest(req);
+    if (reqUser) {
+      authorized = true;
+      repoOwner = reqUser;
+    }
+  }
+
+  if (!authorized) {
+    res.writeHead(401, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ error: 'Неверный или отсутствующий токен авторизации CI' }));
+    return;
+  }
+
+  const commitSha = body.commitSha || 'unknown-sha';
+  const failOnCritical = body.failOnCritical !== false;
+  const requestedWfId = body.workflowId || boundWorkflowId;
+
+  let targetTemplate: any = null;
+  if (requestedWfId) {
+    targetTemplate = templates.getById(requestedWfId) || (await templates.getAllAsync()).find(t => t.id === requestedWfId);
+  }
+  if (!targetTemplate) {
+    targetTemplate = templates.getById('template-full-audit')!;
+  }
+
+  // Клонируем граф и подменяем source.local -> source.git под присланный репозиторий
+  const graph: WorkflowGraph = JSON.parse(JSON.stringify(targetTemplate.graph));
+  const repoUrl = rawRepo
+    ? (rawRepo.startsWith('http') ? rawRepo : `https://github.com/${normalizedFullRepo}.git`)
+    : '';
+  const branch = (body.branch || 'main').trim();
+
+  for (const node of graph.nodes) {
+    node.settings = node.settings || {};
+    if (repoUrl && (node.type === 'source.local' || node.type === 'source.git')) {
+      node.type = 'source.git';
+      node.settings.repoUrl = repoUrl;
+      node.settings.branch = branch;
+      if (!node.settings.token && repoOwner?.githubToken) {
+        node.settings.token = repoOwner.githubToken; // сработает даже для приватных репо
       }
-
-      if (!authorized && process.env.CI_API_TOKEN) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Неверный или отсутствующий токен авторизации CI (X-CI-Token / Authorization)' }));
-        return;
+    } else if ((node.type === 'ai.explainer' || node.type === 'ai.gigachat') && repoOwner) {
+      if (!node.settings.credentials && repoOwner.gigachatCredentials) {
+        node.settings.credentials = repoOwner.gigachatCredentials;
       }
-
-      const body = await parseJsonBody(req);
-      const commitSha = body.commitSha || 'unknown-sha';
-      const failOnCritical = body.failOnCritical !== false;
-      const requestedWfId = body.workflowId;
-
-      // Select template or default
-      let targetTemplate: any = null;
-      if (requestedWfId) {
-        targetTemplate = templates.getById(requestedWfId) || (await templates.getAllAsync()).find(t => t.id === requestedWfId);
+    } else if ((node.type === 'notify.channel' || node.type === 'notify.telegram') && repoOwner) {
+      if (!node.settings.telegramBotToken && repoOwner.telegramBotToken) {
+        node.settings.telegramBotToken = repoOwner.telegramBotToken;
       }
-      if (!targetTemplate) {
-        targetTemplate = templates.getById('template-full-audit')!;
+      if ((!node.settings.telegramChatId || node.settings.telegramChatId === '@security_audit') && repoOwner.telegramChatId) {
+        node.settings.telegramChatId = repoOwner.telegramChatId;
       }
+    }
+  }
 
-      const initialData: Record<string, any> = {};
-      if (body.repo || body.repository) {
-        initialData.repoUrl = body.repo || body.repository;
-        initialData.codePath = body.codePath || body.repo || body.repository;
-      }
-      if (body.codePath) initialData.codePath = body.codePath;
-      if (body.branch) initialData.branch = body.branch;
+  const initialData: Record<string, any> = { repoUrl, branch, commitSha };
+  const result = await engine.executeWorkflow(graph, initialData, (event) => {
+    broadcastEvent(event);
+  });
 
-      const result = await engine.executeWorkflow(targetTemplate.graph, initialData, (event) => {
-        broadcastEvent(event);
-      });
-
-      const findings: any[] = extractWorkflowFindings(targetTemplate?.graph, result);
+      const findings: any[] = extractWorkflowFindings(graph, result);
       const criticalCount = findings.filter(f => f.severity === 'CRITICAL').length;
       const highCount = findings.filter(f => f.severity === 'HIGH').length;
       const mediumCount = findings.filter(f => f.severity === 'MEDIUM').length;
@@ -1148,8 +1205,51 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+
+    async function upsertGithubActionsSecret(
+  fullRepo: string,
+  githubToken: string,
+  secretName: string,
+  secretValue: string
+): Promise<void> {
+  const keyRes = await fetch(`https://api.github.com/repos/${fullRepo}/actions/secrets/public-key`, {
+    headers: {
+      'Authorization': `Bearer ${githubToken}`,
+      'User-Agent': 'uncflow-AppSec',
+      'Accept': 'application/vnd.github+json'
+    }
+  });
+  if (!keyRes.ok) {
+    const errText = await keyRes.text();
+    throw new Error(`Не удалось получить public-key репозитория (${keyRes.status}): ${errText}`);
+  }
+  const { key, key_id } = await keyRes.json() as { key: string; key_id: string };
+
+  await _sodium.ready;
+  const binKey = _sodium.from_base64(key, _sodium.base64_variants.ORIGINAL);
+  const binSec = _sodium.from_string(secretValue);
+  const encBytes = _sodium.crypto_box_seal(binSec, binKey);
+  const encryptedValue = _sodium.to_base64(encBytes, _sodium.base64_variants.ORIGINAL);
+
+  const putSecRes = await fetch(`https://api.github.com/repos/${fullRepo}/actions/secrets/${secretName}`, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${githubToken}`,
+      'User-Agent': 'uncflow-AppSec',
+      'Accept': 'application/vnd.github+json',
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({ encrypted_value: encryptedValue, key_id })
+  });
+  if (!putSecRes.ok) {
+    const errText = await putSecRes.text();
+    throw new Error(`Не удалось сохранить секрет ${secretName} в GitHub (${putSecRes.status}): ${errText}`);
+  }
+}
+
+
     // 8b. POST /api/ci/install-github (1-Click GitHub Actions installation)
-    if (req.method === 'POST' && pathname === '/api/ci/install-github') {
+if (req.method === 'POST' && pathname === '/api/ci/install-github') {
       const user = await getUserFromRequest(req);
       if (!user || !user.githubToken) {
         res.writeHead(401, { 'Content-Type': 'application/json' });
@@ -1168,11 +1268,66 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const serverUrl = getPublicBaseUrl(req);
-        const workflowYaml = CiCdManager.generateGitHubWorkflow(serverUrl, process.env.CI_API_TOKEN || 'SECRET_CI_KEY');
+        const repoKey = `ci_repo:${fullRepo.toLowerCase()}`;
+
+        // 1. Генерируем уникальный CI-токен для этого репозитория и сохраняем в Vault (БД)
+        const repoCiToken = `unc_ci_${crypto.randomBytes(24).toString('hex')}`;
+        const vaultPayload = SecretVault.encrypt(JSON.stringify({
+          token: repoCiToken,
+          userId: user.id,
+          repo: fullRepo,
+          workflowId: body.workflowId || 'template-full-audit'
+        }));
+        await db.saveSecret(repoKey, vaultPayload, `CI/CD token for ${fullRepo}`);
+
+        // 2. Получаем публичный ключ репозитория для шифрования GitHub Actions Secret
+        const keyRes = await fetch(`https://api.github.com/repos/${fullRepo}/actions/secrets/public-key`, {
+          headers: {
+            'Authorization': `Bearer ${user.githubToken}`,
+            'User-Agent': 'uncflow-AppSec',
+            'Accept': 'application/vnd.github+json'
+          }
+        });
+        if (!keyRes.ok) {
+          const errText = await keyRes.text();
+          throw new Error(`Не удалось получить public-key репозитория (${keyRes.status}): ${errText}`);
+        }
+        const { key, key_id } = await keyRes.json() as { key: string; key_id: string };
+
+        // 3. Шифруем токен через libsodium и сохраняем секрет UNCFLOW_CI_TOKEN в GitHub Actions
+        const sodiumMod: any = (_sodium as any).default || _sodium;
+        await sodiumMod.ready;
+        const sodium = sodiumMod.from_base64 ? sodiumMod : (sodiumMod.default || _sodium);
+
+        const binKey = sodium.from_base64(key, sodium.base64_variants.ORIGINAL);
+        const binSec = sodium.from_string(repoCiToken);
+        const encBytes = sodium.crypto_box_seal(binSec, binKey);
+        const encryptedSecretValue = sodium.to_base64(encBytes, sodium.base64_variants.ORIGINAL);
+
+        const putSecRes = await fetch(`https://api.github.com/repos/${fullRepo}/actions/secrets/UNCFLOW_CI_TOKEN`, {
+          method: 'PUT',
+          headers: {
+            'Authorization': `Bearer ${user.githubToken}`,
+            'User-Agent': 'uncflow-AppSec',
+            'Accept': 'application/vnd.github+json',
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            encrypted_value: encryptedSecretValue,
+            key_id
+          })
+        });
+        if (!putSecRes.ok) {
+          const errText = await putSecRes.text();
+          throw new Error(`Не удалось сохранить секрет UNCFLOW_CI_TOKEN в GitHub (${putSecRes.status}): ${errText}`);
+        }
+
+        // 4. Генерируем YAML (без открытых ключей, со ссылкой на секрет)
+        const workflowYaml = CiCdManager.generateGitHubWorkflow(serverUrl, '${{ secrets.UNCFLOW_CI_TOKEN }}');
         const encodedContent = Buffer.from(workflowYaml).toString('base64');
         const filePath = '.github/workflows/security-gate.yml';
 
-        // Check if file already exists (to obtain sha for update)
+        // 5. Проверяем, есть ли уже этот файл (нужен sha для обновления)
         let fileSha: string | undefined;
         try {
           const checkRes = await fetch(`https://api.github.com/repos/${fullRepo}/contents/${filePath}?ref=${branch}`, {
@@ -1183,12 +1338,12 @@ const server = http.createServer(async (req, res) => {
             }
           });
           if (checkRes.ok) {
-            const fileData = await checkRes.json();
+            const fileData: any = await checkRes.json();
             fileSha = fileData.sha;
           }
         } catch {}
 
-        // Create or update file
+        // 6. Создаём или обновляем .github/workflows/security-gate.yml в репозитории пользователя
         const putPayload: any = {
           message: 'ci: add uncflow automated security gatekeeper workflow',
           content: encodedContent,
@@ -1208,20 +1363,22 @@ const server = http.createServer(async (req, res) => {
         });
 
         if (!putRes.ok) {
-          const errData = await putRes.json();
+          const errData: any = await putRes.json().catch(() => ({}));
           throw new Error(errData.message || `GitHub API error ${putRes.status}`);
         }
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({
           success: true,
-          message: `Файл ${filePath} успешно установлен в репозиторий ${fullRepo}!`,
-          workflowPath: filePath
+          message: `CI/CD подключён: секрет UNCFLOW_CI_TOKEN и файл ${filePath} установлены в ${fullRepo}!`,
+          workflowPath: filePath,
+          actionsUrl: `https://github.com/${fullRepo}/actions`
         }));
         return;
       } catch (err: any) {
+        console.error('❌ [install-github error]:', err);
         res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ success: false, error: err.message }));
+        res.end(JSON.stringify({ success: false, error: err?.message || 'Internal Server Error' }));
         return;
       }
     }
