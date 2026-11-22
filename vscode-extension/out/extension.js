@@ -63,6 +63,43 @@ async function getGitRemote(folderPath) {
         return undefined;
     }
 }
+async function loginToServer() {
+    const email = await vscode.window.showInputBox({
+        prompt: 'Email для входа в uncflow',
+        ignoreFocusOut: true
+    });
+    if (!email)
+        return false;
+    const password = await vscode.window.showInputBox({
+        prompt: 'Пароль',
+        password: true,
+        ignoreFocusOut: true
+    });
+    if (!password)
+        return false;
+    try {
+        const serverUrl = vscode.workspace.getConfiguration('uncflow')
+            .get('serverUrl', 'https://uncflow.duckdns.org')
+            .trim()
+            .replace(/\/+$/, '');
+        const response = await fetch(`${serverUrl}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email: email.trim(), password })
+        });
+        const data = await response.json();
+        if (!response.ok || !data.token) {
+            throw new Error(data.error || `HTTP ${response.status}`);
+        }
+        await client.setAuthToken(data.token);
+        void vscode.window.showInformationMessage(`uncflow: выполнен вход как ${data.user?.name || email}`);
+        return true;
+    }
+    catch (err) {
+        void vscode.window.showErrorMessage(`Ошибка входа uncflow: ${err.message}`);
+        return false;
+    }
+}
 function activate(context) {
     workspaceState.init(context);
     client = new client_1.UncflowClient(context);
@@ -142,38 +179,7 @@ function activate(context) {
         vscode.commands.executeCommand('workbench.action.openSettings', 'uncflow');
     });
     const loginCmd = vscode.commands.registerCommand('uncflow.login', async () => {
-        const email = await vscode.window.showInputBox({
-            prompt: 'Email для входа в uncflow',
-            ignoreFocusOut: true
-        });
-        if (!email)
-            return;
-        const password = await vscode.window.showInputBox({
-            prompt: 'Пароль',
-            password: true,
-            ignoreFocusOut: true
-        });
-        if (!password)
-            return;
-        try {
-            const serverUrl = vscode.workspace.getConfiguration('uncflow')
-                .get('serverUrl', 'https://uncflow.duckdns.org')
-                .replace(/\/+$/, '');
-            const response = await fetch(`${serverUrl}/api/auth/login`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ email: email.trim(), password })
-            });
-            const data = await response.json();
-            if (!response.ok || !data.token) {
-                throw new Error(data.error || `HTTP ${response.status}`);
-            }
-            await client.setAuthToken(data.token);
-            vscode.window.showInformationMessage(`uncflow: выполнен вход как ${data.user?.name || email}`);
-        }
-        catch (err) {
-            vscode.window.showErrorMessage(`Ошибка входа uncflow: ${err.message}`);
-        }
+        await loginToServer();
     });
     const logoutCmd = vscode.commands.registerCommand('uncflow.logout', async () => {
         await client.setAuthToken('');
@@ -209,6 +215,7 @@ function activate(context) {
     context.subscriptions.push(statusBarItem, diagnosticsManager, runLastCmd, selectCmd, scanFileCmd, openDashboardCmd, openSettingsCmd, loginCmd, logoutCmd, clearCmd, refreshTreeCmd, showDetailsCmd, onSaveListener);
 }
 async function executeAudit(folderPath, scenarioId, scenarioTitle) {
+    await client.loadAuthToken();
     await vscode.window.withProgress({
         location: vscode.ProgressLocation.Notification,
         title: 'uncflow Security Platform',
@@ -243,11 +250,25 @@ async function executeAudit(folderPath, scenarioId, scenarioTitle) {
             progress.report({ message: `Выполнение сценария "${scenarioTitle}"...` });
             const repository = global.__uncflowRepository;
             delete global.__uncflowRepository;
-            const result = await client.runAudit(scenarioId, {
+            const runParams = {
                 codePath: codePath || undefined,
                 repository: repository?.url,
                 branch: repository?.branch
-            });
+            };
+            let result;
+            try {
+                result = await client.runAudit(scenarioId, runParams);
+            }
+            catch (err) {
+                if (!/Неверный или отсутствующий токен авторизации CI|401|unauthorized/i.test(err.message)) {
+                    throw err;
+                }
+                const loginAction = 'Войти в uncflow';
+                const action = await vscode.window.showErrorMessage('Для аудита на сервере требуется авторизация. Войдите в uncflow, чтобы продолжить.', loginAction);
+                if (action !== loginAction || !(await loginToServer()))
+                    return;
+                result = await client.runAudit(scenarioId, runParams);
+            }
             // Apply findings to editor squiggles and problems panel
             diagnosticsManager.applyFindings(result.findings || [], folderPath);
             // Update state for tree view and detail cards
