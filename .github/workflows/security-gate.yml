@@ -1,0 +1,57 @@
+name: uncflow Security Gatekeeper
+
+on:
+  push:
+    branches: [ "main", "master", "develop" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+jobs:
+  security-audit:
+    name: Run uncflow AppSec Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Run uncflow Audit via Platform API
+        run: |
+          echo "Starting uncflow security scan for ${{ github.repository }}..."
+
+          HTTP_CODE=$(curl -sS -w "%{http_code}" -o audit-result.json \
+            -X POST "http://localhost:3001/api/ci/run" \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer ${{ secrets.UNCFLOW_CI_TOKEN }}" \
+            -d '{
+              "repo": "${{ github.repository }}",
+              "commitSha": "${{ github.sha }}",
+              "branch": "${{ github.head_ref || github.ref_name }}",
+              "failOnCritical": true
+            }')
+
+          echo "HTTP status: $HTTP_CODE"
+          if [ "$HTTP_CODE" -ne 200 ]; then
+            cat audit-result.json
+            echo "::error::uncflow API returned HTTP $HTTP_CODE"
+            exit 1
+          fi
+
+          node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.summaryMarkdown || "")' >> $GITHUB_STEP_SUMMARY
+
+          EXIT_CODE=$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.exitCode ?? 1)')
+          TOTAL=$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.totalFindings ?? 0)')
+          CRITICAL=$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.criticalCount ?? 0)')
+          HIGH=$(node -e 'const r=JSON.parse(require("fs").readFileSync("audit-result.json","utf8")); console.log(r.highCount ?? 0)')
+
+          echo "Total findings: $TOTAL (Critical: $CRITICAL, High: $HIGH)"
+
+          if [ "$EXIT_CODE" -ne 0 ]; then
+            echo "::error::uncflow detected blocking vulnerabilities! Build failed."
+            exit "$EXIT_CODE"
+          fi
+
+          echo "Security check passed."
+
+      - name: Upload Security Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: uncflow-audit-result
+          path: audit-result.json
