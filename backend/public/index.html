@@ -5345,7 +5345,7 @@ function selectRepoForAudit(cloneUrl, defaultBranch, repoName) {
       name: 'Git: ' + repoName,
       category: 'source',
       position: { x: 80, y: 120 },
-      config: {
+      settings: {
         repoUrl: cloneUrl,
         branch: defaultBranch || 'main',
         token: ''
@@ -5354,9 +5354,9 @@ function selectRepoForAudit(cloneUrl, defaultBranch, repoName) {
     currentWorkflow.nodes = currentWorkflow.nodes || [];
     currentWorkflow.nodes.unshift(gitNode);
   } else {
-    gitNode.config = gitNode.config || {};
-    gitNode.config.repoUrl = cloneUrl;
-    gitNode.config.branch = defaultBranch || 'main';
+    gitNode.settings = gitNode.settings || {};
+    gitNode.settings.repoUrl = cloneUrl;
+    gitNode.settings.branch = defaultBranch || 'main';
   }
 
   pushHistoryState();
