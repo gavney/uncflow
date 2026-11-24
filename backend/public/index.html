@@ -5333,40 +5333,40 @@
   }
 }
 
-    function selectRepoForAudit(cloneUrl, defaultBranch, repoName) {
-      if (!currentWorkflow) return;
+function selectRepoForAudit(cloneUrl, defaultBranch, repoName) {
+  if (!currentWorkflow) return;
 
-      // Find existing source.git node or create one
-      let gitNode = currentWorkflow.nodes?.find(n => n.type === 'source.git');
-      if (!gitNode) {
-        gitNode = {
-          id: 'node-git-' + Date.now().toString(36),
-          type: 'source.git',
-          name: 'Git: ' + repoName,
-          category: 'source',
-          position: { x: 80, y: 120 },
-          parameters: {
-            repoUrl: cloneUrl,
-            branch: defaultBranch || 'main',
-            token: ''
-          }
-        };
-        currentWorkflow.nodes = currentWorkflow.nodes || [];
-        currentWorkflow.nodes.unshift(gitNode);
-      } else {
-        gitNode.parameters = gitNode.parameters || {};
-        gitNode.parameters.repoUrl = cloneUrl;
-        gitNode.parameters.branch = defaultBranch || 'main';
+  // Find existing source.git node or create one
+  let gitNode = currentWorkflow.nodes?.find(n => n.type === 'source.git');
+  if (!gitNode) {
+    gitNode = {
+      id: 'node-git-' + Date.now().toString(36),
+      type: 'source.git',
+      name: 'Git: ' + repoName,
+      category: 'source',
+      position: { x: 80, y: 120 },
+      config: {
+        repoUrl: cloneUrl,
+        branch: defaultBranch || 'main',
+        token: ''
       }
+    };
+    currentWorkflow.nodes = currentWorkflow.nodes || [];
+    currentWorkflow.nodes.unshift(gitNode);
+  } else {
+    gitNode.config = gitNode.config || {};
+    gitNode.config.repoUrl = cloneUrl;
+    gitNode.config.branch = defaultBranch || 'main';
+  }
 
-      pushHistoryState();
-      closeModal('modal-profile');
-      renderNodeCards();
-      renderConnections();
-      selectNode(gitNode.id);
-      showBanner(`Репозиторий ${repoName} установлен в блок загрузки!`);
-      setTimeout(hideBanner, 3000);
-    }
+  pushHistoryState();
+  closeModal('modal-profile');
+  renderNodeCards();
+  renderConnections();
+  selectNode(gitNode.id);
+  showBanner(`Репозиторий ${repoName} установлен в блок загрузки!`);
+  setTimeout(hideBanner, 3000);
+}
 
     async function loadProfileTemplates() {
       const container = document.getElementById('prof-templates-list');
